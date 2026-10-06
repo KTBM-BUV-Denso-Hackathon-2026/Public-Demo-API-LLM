@@ -1,54 +1,144 @@
-import asyncio
-from fastapi import FastAPI
-from openai import AsyncOpenAI
-from fastapi.responses import StreamingResponse
-import psycopg2
-from database.controllers import batch_search_rag_data, save_to_raw_data, save_to_rag_data, save_to_embedding_data, search_rag_data
+"""
+Entrypoint FastAPI của microservice ``llm_api``.
 
-# Client kết nối tới LMDeploy Server
-lmdeploy_client = AsyncOpenAI(
-    api_key="EMPTY",
-    base_url="http://lmdeploy-server:23333/v1" # IP/Domain của con GPU LMDeploy
+Endpoint:
+- ``GET  /health``      : kiểm tra sống/chết.
+- ``POST /chat``        : một lượt hỏi - đáp (JSON hoặc SSE nếu ``stream=true``).
+- ``POST /chat/batch``  : nhiều lượt hỏi - đáp (JSON hoặc SSE gộp nếu ``stream=true``).
+
+Chạy:
+    uvicorn main:app --host 0.0.0.0 --port 8000
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import AsyncIterator
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+
+import services
+from schemas import (
+    BatchChatRequest,
+    BatchChatResponse,
+    ChatRequest,
+    ChatResponse,
+    StreamEvent,
 )
 
-app = FastAPI()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
-@app.post("/chat")
-async def handle_user_request(user_id: str, history: list, new_question: str):
+app = FastAPI(
+    title="DENSO LLM API",
+    version="1.0.0",
+    description=(
+        "Microservice RAG + LLM. Hỗ trợ batch inference, RAG search và "
+        "streaming (SSE) tới LMDeploy Server."
+    ),
+)
+
+SSE_MEDIA_TYPE = "text/event-stream"
+# Ngăn proxy (nginx...) đệm response, đảm bảo token được đẩy đi ngay.
+SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+
+
+# ---------------------------------------------------------------------------
+# Tiện ích
+# ---------------------------------------------------------------------------
+def _to_sse(event: StreamEvent) -> str:
     """
-    Service này nhận request từ client
+    Mã hoá một ``StreamEvent`` thành khung SSE.
+
+    Dùng ``exclude_none`` để payload gọn, và ``ensure_ascii=False`` để giữ
+    nguyên tiếng Việt trong JSON.
     """
-    # 2. RAG Search: Query pgvector để lấy Context
-    context = await search_rag_data(new_question)
+    payload = event.model_dump(exclude_none=True)
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
-    # 3. Tạo payload tin nhắn gửi cho LMDeploy:
-    # Bản tin nhắn gửi cho LMDeploy thì KÈM RAG Context
-    rag_user_message = {
-        "role": "user",
-        "content": f"THÔNG TIN THAM KHẢO:\n{context}\n\nCÂU HỎI: {new_question}"
-    }
-    messages_for_llm = history + [rag_user_message]
 
-    # 4. Gửi tới LMDeploy Server (LMDeploy tự động Continuous Batching trên GPU)
-    response = await lmdeploy_client.chat.completions.create(
-        model="Qwen/Qwen2.5-7B-Instruct",
-        messages=messages_for_llm,
-        temperature=0.7
+async def _sse_generator(
+    events: AsyncIterator[StreamEvent],
+) -> AsyncIterator[str]:
+    """Bọc một luồng ``StreamEvent`` thành luồng text đúng định dạng SSE."""
+    async for event in events:
+        yield _to_sse(event)
+
+
+def _streaming_response(events: AsyncIterator[StreamEvent]) -> StreamingResponse:
+    """Tạo ``StreamingResponse`` SSE từ luồng event."""
+    return StreamingResponse(
+        _sse_generator(events),
+        media_type=SSE_MEDIA_TYPE,
+        headers=SSE_HEADERS,
     )
-    ai_answer = response.choices[0].message.content
 
-    # 5. LƯU VÀO DB: Chỉ lưu câu hỏi GỐC + câu trả lời của AI
-    clean_user_message = {"role": "user", "content": new_question}
-    clean_ai_message = {"role": "assistant", "content": ai_answer}
-    
-    await save_chat_history_to_db(user_id, [clean_user_message, clean_ai_message])
 
-    return ai_answer
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+@app.get("/health", tags=["system"])
+async def health() -> dict:
+    """Endpoint kiểm tra service còn sống."""
+    return {"status": "ok"}
 
-# Khi có N người dùng gửi request cùng lúc đến Service:
-async def handle_multiple_requests(requests_list):
-    # Tất cả các request này được gửi đồng thời sang LMDeploy Server
-    # Engine của LMDeploy sẽ gom (batch) chúng lại trên GPU xử lý 1 lượt cực nhanh
-    tasks = [handle_user_request(req["user_id"], req["question"]) for req in requests_list]
-    results = await asyncio.gather(*tasks)
-    return results
+
+@app.post("/chat", response_model=ChatResponse, tags=["chat"])
+async def chat(request: ChatRequest):
+    """
+    Xử lý một lượt hỏi - đáp.
+
+    - ``stream=false`` (mặc định): trả JSON ``ChatResponse``.
+    - ``stream=true``: trả SSE, mỗi event là một ``StreamEvent``.
+
+    RAG search luôn chạy trước khi gọi model, kể cả ở chế độ streaming, nên
+    câu trả lời vẫn dựa trên context truy hồi được.
+    """
+    if request.stream:
+        return _streaming_response(services.stream_single(request))
+
+    try:
+        return await services.answer(request)
+    except Exception as exc:  # noqa: BLE001 - trả lỗi rõ ràng cho client
+        logger.exception("Lỗi xử lý /chat cho chat_id=%s", request.chat_id)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Lỗi khi xử lý yêu cầu: {type(exc).__name__}: {exc}",
+        ) from exc
+
+
+@app.post("/chat/batch", response_model=BatchChatResponse, tags=["chat"])
+async def chat_batch(request: BatchChatRequest):
+    """
+    Xử lý nhiều lượt hỏi - đáp trong một request.
+
+    - ``stream=false`` (mặc định): trả JSON ``BatchChatResponse`` (mỗi item
+      một kết quả, đúng thứ tự).
+    - ``stream=true``: trả một SSE stream gộp; mỗi event mang ``index`` để
+      client tách luồng theo item.
+
+    Khi không streaming, các item được chạy song song (``asyncio.gather``)
+    và LMDeploy sẽ tự gom batch trên GPU.
+    """
+    if request.stream:
+        return _streaming_response(services.stream_batch(request.items))
+
+    try:
+        results = await services.answer_batch(request.items)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Lỗi xử lý /chat/batch (%d item)", len(request.items))
+        raise HTTPException(
+            status_code=502,
+            detail=f"Lỗi khi xử lý batch: {type(exc).__name__}: {exc}",
+        ) from exc
+
+    return BatchChatResponse(results=results)

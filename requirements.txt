@@ -1,0 +1,10 @@
+# Dependencies trực tiếp của microservice llm_api.
+# (torch/transformers được kéo theo bởi sentence-transformers.)
+
+fastapi>=0.115
+uvicorn>=0.30
+pydantic>=2.7
+openai>=1.40
+psycopg2>=2.9
+sentence-transformers>=3.0
+python-dotenv>=1.0
