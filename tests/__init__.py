@@ -1,14 +1,23 @@
 """Package chứa test cho microservice llm_api.
 
-Test chạy hoàn toàn offline: không cần vector DB, LMDeploy, và cũng không cần
-biết ``INTERNAL_API_TOKEN`` thật. Vì vậy ta tắt auth nội bộ **mặc định** cho cả
-bộ test; ``tests/test_api.py::SecurityTests`` tự bật lại bằng ``mock.patch``
-để kiểm tra đúng hành vi bật/tắt.
+Bộ test phải **chạy hoàn toàn offline và xác định**: không cần vector DB,
+LMDeploy, Ollama hay bất kỳ server LLM nào đang chạy.
 
-Làm vậy giúp test không phụ thuộc vào file ``.env`` của máy đang chạy.
+Vì vậy, khi import package này ta ép hai thứ:
+
+- ``INTERNAL_API_TOKEN = ""``  -> endpoint POST không đòi header token.
+- ``LLM_PROVIDER = "mock"``    -> provider giả lập, không gọi ra ngoài.
+
+Đây là LƯỚI AN TOÀN: nếu một test quên mock ``services._complete`` /
+``services._stream`` thì nó vẫn chạy nhanh và ổn định, thay vì âm thầm gọi
+LLM thật (làm test chậm hàng giây và phụ thuộc máy đang chạy).
+Các test cố ý kiểm tra hành vi provider thật sẽ tự `mock.patch` lại biến này.
 """
 
 import settings
 
 # Rỗng = auth tắt -> endpoint POST không đòi header X-Internal-Token.
 settings.INTERNAL_API_TOKEN = ""
+
+# Ép provider giả lập để test không bao giờ gọi LLM thật (xem docstring).
+settings.LLM_PROVIDER = "mock"

@@ -104,6 +104,16 @@ INTERNAL_API_TOKEN: str = _get_str("INTERNAL_API_TOKEN", "")
 MAX_BATCH_SIZE: int = _get_int("MAX_BATCH_SIZE", 32)
 
 # ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
+# Rất quan trọng khi dùng model NHỎ (1.5B–3B): không có chỉ dẫn rõ, các model đó
+# rất dễ trả lời lạch hoặc bịa số liệu kỹ thuật. System prompt dưới đây ép
+# model chỉ dựa trên tài liệu được cung cấp và nói thẳng khi không có thông tin.
+#
+# Để trống -> không gửi system message (giữ hành vi cũ).
+SYSTEM_PROMPT: str = _get_str("SYSTEM_PROMPT", "")
+
+# ---------------------------------------------------------------------------
 # Giới hạn kích thước đầu vào (chống prompt khổng lồ)
 # ---------------------------------------------------------------------------
 # Khớp với ``AskRequestSerializer.question`` của denso_backend (max_length=8000).

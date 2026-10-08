@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import AsyncIterator, List, Optional, Sequence, Tuple, Union
 
 import settings
@@ -45,6 +46,35 @@ def build_rag_prompt(context: str, question: str) -> str:
     return f"THÔNG TIN THAM KHẢO:\n{context}\n\nCÂU HỎI: {question}"
 
 
+DEFAULT_SYSTEM_PROMPT = (
+    "Bạn là trợ lý hỏi đáp tài liệu kỹ thuật nội bộ của DENSO.\n"
+    "Nguyên tắc bắt buộc:\n"
+    "1. CHỈ trả lời dựa trên phần \"THÔNG TIN THAM KHẢO\" được cung cấp.\n"
+    "2. Nếu tài liệu không có đủ thông tin để trả lời, phải nói thẳng:\n"
+    "   \"Không tìm thấy thông tin này trong tài liệu đã nạp.\"\n"
+    "   Tuyệt đối không đoán, không tự bịa số liệu hay quy trình.\n"
+    "3. Trả lời bằng tiếng Việt, ngắn gọn, rõ ràng, dùng thuật ngữ kỹ thuật "
+    "đúng như trong tài liệu.\n"
+    "4. Nếu câu hỏi ngoài phạm vi tài liệu kỹ thuật (ví dụ chào hỏi thời tiết), "
+    "trả lời ngắn gọn rằng bạn chỉ hỗ trợ tra cứu tài liệu kỹ thuật."
+)
+
+
+def system_prompt() -> Optional[str]:
+    """System prompt sẽ gửi cho LLM.
+
+    Ưu tiên biến môi trường ``SYSTEM_PROMPT``; nếu để trống thì dùng mặc định
+    ở trên. Đặt ``SYSTEM_PROMPT=""`` cố ý (không phải rỗng do unset) sẽ tắt.
+    """
+    if hasattr(settings, "SYSTEM_PROMPT"):
+        if settings.SYSTEM_PROMPT:
+            return settings.SYSTEM_PROMPT
+        # Biến tồn tại nhưng rỗng -> người dùng cố ý tắt.
+        if os.environ.get("SYSTEM_PROMPT") is not None:
+            return None
+    return DEFAULT_SYSTEM_PROMPT
+
+
 def build_messages(
     history: Sequence[ChatMessage],
     context: str,
@@ -55,8 +85,15 @@ def build_messages(
 
     Context RAG chỉ được chèn vào lượt hỏi MỚI NHẤT; history giữ nguyên bản
     gốc (không nhét lại context cũ) để tiết kiệm token và tránh lặp.
+
+    System prompt được đặt ở đầu danh sách (nếu có) — kể cả khi chat có sẵn
+    lịch sử, để chỉ dẫn luôn có hiệu lực.
     """
-    messages = [{"role": message.role, "content": message.content} for message in history]
+    messages: List[dict] = []
+    instruction = system_prompt()
+    if instruction:
+        messages.append({"role": "system", "content": instruction})
+    messages.extend({"role": m.role, "content": m.content} for m in history)
     messages.append({"role": "user", "content": build_rag_prompt(context, question)})
     return messages
 
