@@ -32,7 +32,10 @@ class TestEncodeTexts(unittest.TestCase):
         self.assertEqual(engine.encode_texts([]), [])
 
     def test_batch_encode_returns_plain_lists(self):
-        with mock.patch.object(engine, "get_model", return_value=FakeModel(4)):
+        # FakeModel trả 4 chiều nên phải khai báo EMBEDDING_DIM=4 cho khớp.
+        with mock.patch.object(settings, "EMBEDDING_DIM", 4), mock.patch.object(
+            engine, "get_model", return_value=FakeModel(4)
+        ):
             vectors = engine.encode_texts(["a", "b", "c"])
 
         self.assertEqual(len(vectors), 3)
@@ -63,6 +66,16 @@ class TestEncodeTexts(unittest.TestCase):
             self.assertEqual(len(vectors[0]), 4)
         finally:
             settings.EMBEDDING_DIM = original_dim
+
+
+class TestEmbeddingDefaults(unittest.TestCase):
+    """Cấu hình mặc định phải khớp cột vector(768) trong DB."""
+
+    def test_default_dimension_matches_database(self):
+        self.assertEqual(settings.EMBEDDING_DIM, 768)
+
+    def test_dimension_check_is_strict_by_default(self):
+        self.assertTrue(settings.STRICT_EMBEDDING_DIM)
 
 
 class TestModelCache(unittest.TestCase):

@@ -283,6 +283,9 @@ async def stream_single(
             chat_id=request.chat_id,
             index=index,
             messages=build_updated_history(request, "".join(parts)),
+            # Đính kèm nguồn RAG để client hiển thị được "nguồn tham khảo"
+            # ngay cả khi dùng streaming (cùng định dạng với ChatResponse).
+            contexts=[context] if context else [],
         )
     except Exception as exc:  # noqa: BLE001 - trả lỗi về client qua SSE
         logger.exception("Lỗi khi streaming chat_id=%s", request.chat_id)

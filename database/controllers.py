@@ -1,22 +1,21 @@
 """
-Truy vấn RAG trên vector DB (PostgreSQL + pgvector).
-
-File này gồm hai nhóm hàm:
-
-1. Nhóm ghi dữ liệu (``save_to_*``): dùng cho pipeline nạp dữ liệu.
-2. Nhóm truy hồi (``search_*``, ``search_by_embeddings``): dùng cho lúc
-   inference để lấy context đưa vào prompt.
+Truy hồi RAG trên PostgreSQL + pgvector (DB chung với ``denso_backend``).
 
 Ghi chú kỹ thuật quan trọng:
 - Vector embedding của chunk nằm ở bảng ``rag_chunkdata`` (cột ``vector``,
-  kiểu ``vector(N)`` của pgvector), KHÔNG nằm ở ``rag_ragdata``.
+  kiểu ``vector(N)`` của pgvector).
 - Toán tử ``<=>`` là cosine distance của pgvector; sắp xếp tăng dần cho ra
   các chunk gần nghĩa nhất.
+- ``RAG_CHUNK_TABLE`` được nội suy từ thẻ truy hồi nên phải là hằng số an toàn
+  (nó được nội suy thẳng vào SQL, không dùng placeholder của psycopg2).
+
+Việc GHI dữ liệu vào bảng này do ``rag_worker`` đảm nhiệm, không nằm ở đây.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from typing import List, Sequence
 
 import settings
@@ -24,74 +23,29 @@ from database.config import get_db
 
 logger = logging.getLogger(__name__)
 
+#: Tên bảng hợp lệ: chữ/số/gạch dưới, có thể có schema (vd ``public.rag_chunkdata``).
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
 
-# ---------------------------------------------------------------------------
-# Nhóm ghi dữ liệu (ingestion)
-# ---------------------------------------------------------------------------
-def save_to_raw_data(columns: Sequence[str], values: Sequence) -> None:
+
+def _safe_table(table: str) -> str:
+    """Xác thực tên bảng trước khi nội suy vào SQL.
+
+    ``RAG_CHUNK_TABLE`` không thể dùng placeholder của psycopg2 (placeholder chỉ
+    thay giá trị, không thay định danh), nên nó được ghép thẳng vào câu SQL. Vì
+    vậy phải kiểm tra bằng allow-list để một giá trị cấu hình sai không biến thành
+    SQL injection.
+
+    Raises:
+        ValueError: nếu tên bảng không hợp lệ.
     """
-    Ghi một bản ghi vào bảng ``rag_rawdata``.
-
-    Args:
-        columns: Danh sách tên cột.
-        values: Danh sách giá trị tương ứng với ``columns``.
-    """
-    _insert("rag_rawdata", columns, values)
-
-
-def save_to_rag_data(columns: Sequence[str], values: Sequence) -> None:
-    """
-    Ghi một bản ghi vào bảng ``rag_ragdata``.
-
-    Args:
-        columns: Danh sách tên cột.
-        values: Danh sách giá trị tương ứng với ``columns``.
-    """
-    _insert("rag_ragdata", columns, values)
+    if not _IDENTIFIER_RE.match(table or ""):
+        raise ValueError(
+            f"RAG_CHUNK_TABLE không hợp lệ: {table!r}. "
+            "Chỉ chấp nhận dạng 'ten_bang' hoặc 'schema.ten_bang'."
+        )
+    return table
 
 
-def save_to_embedding_data(columns: Sequence[str], values: Sequence) -> None:
-    """
-    Ghi một chunk (kèm vector) vào bảng ``rag_chunkdata``.
-
-    Lưu ý: bảng ``rag_chunkdata`` có tập cột cố định, nên câu lệnh dùng
-    danh sách cột cố định thay vì ``columns`` truyền vào.
-
-    Args:
-        columns: Danh sách tên cột (giữ để tương thích chữ ký hàm cũ).
-        values: Giá trị theo thứ tự
-            ``(id, chunk_content, chunk_index, metadata, vector, fts)``.
-    """
-    query = (
-        "INSERT INTO rag_chunkdata "
-        "(id, chunk_content, chunk_index, metadata, vector, fts) "
-        "VALUES (%s, %s, %s, %s, %s, %s)"
-    )
-    with get_db() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(query, values)
-            conn.commit()
-
-
-def _insert(table: str, columns: Sequence[str], values: Sequence) -> None:
-    """
-    Hàm ghi dùng chung: tạo câu INSERT động an toàn bằng placeholder ``%s``.
-
-    ``table`` và tên cột KHÔNG đến từ input người dùng nên an toàn với
-    SQL injection; giá trị luôn truyền qua placeholder.
-    """
-    placeholders = ", ".join(["%s"] * len(values))
-    columns_str = ", ".join(columns)
-    query = f"INSERT INTO {table} ({columns_str}) VALUES ({placeholders})"
-    with get_db() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(query, values)
-            conn.commit()
-
-
-# ---------------------------------------------------------------------------
-# Nhóm truy hồi (retrieval)
-# ---------------------------------------------------------------------------
 def _to_vector_literal(vector: Sequence[float]) -> str:
     """
     Chuyển một vector Python thành literal pgvector, ví dụ ``[0.1,-0.2,...]``.
@@ -118,11 +72,14 @@ def search_by_embeddings(
     Returns:
         Danh sách context string, mỗi phần tử ứng với một embedding đầu vào.
         Nếu không có chunk nào phù hợp, phần tử tương ứng là chuỗi rỗng.
+
+    Raises:
+        ValueError: nếu ``top_k`` không dương.
     """
     if top_k <= 0:
         raise ValueError("top_k phải là số nguyên dương.")
 
-    table = settings.RAG_CHUNK_TABLE
+    table = _safe_table(settings.RAG_CHUNK_TABLE)
     query = (
         f"SELECT chunk_content FROM {table} "
         f"WHERE vector IS NOT NULL "
@@ -142,7 +99,7 @@ def search_by_embeddings(
 
 def search_rag_data(latest_query: str, top_k: int = 5) -> str:
     """
-    Truy hồi context cho MỘT câu hỏi.
+    Truy hồi context cho MỘT câu hỏi (encode + search).
 
     Args:
         latest_query: Câu hỏi cần tìm context.

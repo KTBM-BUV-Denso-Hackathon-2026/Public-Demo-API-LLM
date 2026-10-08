@@ -12,7 +12,8 @@ Client (denso_backend / frontend)
 ┌──────────────────────────────────────────────┐
 │ llm_api (FastAPI)                            │
 │                                              │
-│  main.py      routes + SSE                   │
+│  main.py      routes + SSE + auth           │
+│  security.py  X-Internal-Token              │
 │  services.py  orchestration (RAG → prompt →  │
 │               LLM, single/batch/stream)      │
 │  schemas.py   Pydantic request/response      │
@@ -24,7 +25,7 @@ Client (denso_backend / frontend)
 └──────────────────────────────────────────────┘
         │                        │
         ▼                        ▼
-  Vector DB (pgvector)     LMDeploy Server
+  PostgreSQL + pgvector     LMDeploy Server
   rag_chunkdata            (continuous batching)
 ```
 
@@ -148,8 +149,17 @@ Các biến thường dùng: `LM_DEPLOY_BASE_URL`, `LLM_MODEL`, `RAG_ENABLED`,
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env        # rồi chỉnh các giá trị cho đúng môi trường
-uvicorn main:app --host 0.0.0.0 --port 8000
+cp .env.example .env        # rồi chỉnh DATABASE_URL + INTERNAL_API_TOKEN cho khớp
+uvicorn main:app --host 127.0.0.1 --port 8100
+```
+
+> Cổng là **8100** (denso_backend dùng 8000, rag_worker dùng 8200).
+
+Kiểm tra sống:
+
+```bash
+curl http://127.0.0.1:8100/health
+curl http://127.0.0.1:8100/ready     # {"auth_required": true/false, ...}
 ```
 
 Test (không cần DB và LLM thật):
@@ -158,14 +168,45 @@ Test (không cần DB và LLM thật):
 python -m unittest discover -s tests -v
 ```
 
-## 6. Giả định & giới hạn đã biết
+## 6. Xác thực nội bộ
+
+`POST /chat` và `POST /chat/batch` yêu cầu header:
+
+```
+X-Internal-Token: <INTERNAL_API_TOKEN>
+```
+
+- Header này phải **bằng** `LLM_API_TOKEN` trong `denso_backend/.env` — denso_backend
+  tự gửi kèm, nên nếu bạn dùng đúng luồng thì không cần tự thêm.
+- `GET /health` và `GET /ready` **không** cần token (để monitoring/script kiểm tra được).
+- Để `INTERNAL_API_TOKEN` rỗng = tắt auth, chỉ dùng khi chạy localhost.
+  `/ready` sẽ báo `"auth_required": false` để bạn không bỏ sót.
+
+## 7. Giới hạn đầu vào
+
+| Biến | Mặc định | Ý nghĩa |
+| --- | --- | --- |
+| `MAX_QUESTION_LENGTH` | 8000 | Khớp `AskRequestSerializer.question` của denso_backend |
+| `MAX_HISTORY_MESSAGES` | 200 | Trần cứng cho `history`; vượt → **422** |
+| `MAX_MESSAGE_LENGTH` | 32000 | Trần cứng cho một message |
+
+`denso_backend` tự cắt lịch sử theo `LLM_MAX_HISTORY_MESSAGES` (mặc định 100)
+trước khi gọi, nên hội thoại dài vẫn hoạt động bình thường.
+
+## 8. Giả định & giới hạn đã biết
 
 1. **Số chiều embedding phải khớp** giữa model truy vấn và cột `vector` trong
-   DB. Model mặc định `vietnamese-bi-encoder` trả 768 chiều, trong khi
-   `RagChunkData.vector` (denso_backend) khai báo 1536 chiều → cần thống nhất
-   trước khi chạy thật. Bật `STRICT_EMBEDDING_DIM=true` để phát hiện sớm.
+   DB. Mặc định `vietnamese-bi-encoder` (768) khớp `rag_chunkdata.vector` (768).
+   `STRICT_EMBEDDING_DIM=true` sẽ raise lỗi nếu lệch — đừng tắt ở production.
+   Nếu đổi `EMBEDDING_DIM` thì phải tạo migration mới cho `denso_backend`.
 2. **Truy hồi hiện dùng vector search thuần** trên `rag_chunkdata`. Cột `fts`
    (full-text) đã có sẵn cho hybrid search nhưng chưa bật.
 3. `llm_api` không persist chat history; caller phải lưu `messages` trả về.
 4. `handle_multiple_requests` cũ (hàm rời, không phải endpoint) đã được thay
    bằng endpoint `/chat/batch` + `services.answer_batch`.
+5. `RAG_CHUNK_TABLE` được nội suy thẳng vào SQL nên được kiểm tra bằng
+   allow-list trong `database/controllers.py::_safe_table` — chỉ nhận dạng
+   `ten_bang` hoặc `schema.ten_bang`.
+6. `DATABASE_URL` phải trỏ tới **cùng** DB với `denso_backend`. Sai chỗ này thì
+   upload báo `done` nhưng hỏi đáp không có context nào.
+

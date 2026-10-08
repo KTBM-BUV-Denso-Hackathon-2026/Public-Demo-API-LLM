@@ -1,16 +1,21 @@
 """
-Client gọi LMDeploy Server qua API tương thích OpenAI.
+Client gọi model, hỗ trợ hai provider (``settings.LLM_PROVIDER``):
 
-LMDeploy tự chạy continuous batching trên GPU, nên phía service chỉ cần gửi
-các request song song; không cần tự gom batch ở tầng này.
+- ``openai_compatible`` (mặc định): gọi LMDeploy Server qua API tương thích
+  OpenAI. LMDeploy tự continuous-batching trên GPU nên phía service chỉ cần gửi
+  các request song song.
+- ``mock``: sinh câu trả lời giả lập tại chỗ, KHÔNG cần GPU/model. Chỉ dùng cho
+  dev/test — nội dung trả về được đánh dấu rõ ``[MOCK]`` để không lẫn với kết
+  quả thật.
 
 Module cung cấp hai hàm chính:
 - ``complete``: sinh xong mới trả về (non-streaming).
-- ``stream``: sinh dần từng token (streaming).
+- ``stream``: sinh dần từng đoạn text (streaming).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import AsyncIterator, List, Optional
@@ -22,6 +27,9 @@ import settings
 logger = logging.getLogger(__name__)
 
 _client: Optional[AsyncOpenAI] = None
+
+#: Nhãn đánh dấu câu trả lời của provider ``mock``.
+MOCK_MARKER = "[MOCK]"
 
 
 @dataclass
@@ -55,6 +63,56 @@ def get_client() -> AsyncOpenAI:
     return _client
 
 
+def is_mock() -> bool:
+    """True nếu đang dùng provider giả lập."""
+    return settings.LLM_PROVIDER == "mock"
+
+
+# ---------------------------------------------------------------------------
+# Provider giả lập (dev/test)
+# ---------------------------------------------------------------------------
+def _mock_answer(messages: List[dict]) -> str:
+    """
+    Dựng câu trả lời giả lập nhưng phản ánh đúng dữ liệu đầu vào.
+
+    Hàm bóc phần context RAG (nếu có) để chứng minh context đã được truyền
+    xuống đúng, giúp kiểm thử đường ống RAG mà không cần model thật.
+    """
+    question = ""
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            question = message.get("content", "")
+            break
+
+    context_block = ""
+    if "THÔNG TIN THAM KHẢO:" in question:
+        context_block = question.split("THÔNG TIN THAM KHẢO:", 1)[1]
+        context_block = context_block.split("CÂU HỎI:", 1)[0].strip()
+
+    question_only = question
+    if "CÂU HỎI:" in question:
+        question_only = question.split("CÂU HỎI:", 1)[1].strip()
+
+    chunks = [
+        line[2:].strip()
+        for line in context_block.splitlines()
+        if line.strip().startswith("- ")
+    ]
+
+    lines = [f"{MOCK_MARKER} Đây là câu trả lời sinh bởi provider mock (không có model thật)."]
+    lines.append(f"Câu hỏi nhận được: {question_only}")
+    if chunks:
+        lines.append(f"Số đoạn ngữ cảnh được truy hồi: {len(chunks)}")
+        preview = chunks[0][:160]
+        lines.append(f"Đoạn ngữ cảnh đầu tiên: {preview}")
+    else:
+        lines.append("Không có ngữ cảnh RAG nào được truy hồi.")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# API công khai
+# ---------------------------------------------------------------------------
 async def complete(
     messages: List[dict],
     params: Optional[GenerationParams] = None,
@@ -70,6 +128,9 @@ async def complete(
         Nội dung câu trả lời của model (chuỗi, có thể rỗng).
     """
     params = params or GenerationParams()
+    if is_mock():
+        return _mock_answer(messages)
+
     response = await get_client().chat.completions.create(
         model=params.model,
         messages=messages,
@@ -95,6 +156,15 @@ async def stream(
         Từng đoạn content mới sinh (không rỗng).
     """
     params = params or GenerationParams()
+
+    if is_mock():
+        delay = max(settings.MOCK_STREAM_DELAY_MS, 0) / 1000.0
+        for token in _mock_answer(messages).split(" "):
+            if delay:
+                await asyncio.sleep(delay)
+            yield token + " "
+        return
+
     response_stream = await get_client().chat.completions.create(
         model=params.model,
         messages=messages,

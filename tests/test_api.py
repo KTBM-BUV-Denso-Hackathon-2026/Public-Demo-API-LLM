@@ -270,5 +270,194 @@ class TestPromptBuilding(unittest.TestCase):
         self.assertEqual(params.max_new_tokens, 10)
 
 
+class SecurityTests(unittest.TestCase):
+    """``X-Internal-Token`` trên ``/chat`` và ``/chat/batch``."""
+
+    TOKEN = "unit-test-token"
+
+    @staticmethod
+    def _client():
+        return TestClient(app)
+
+    def test_endpoints_are_reachable_without_token_when_disabled(self):
+        with mock.patch.object(settings, "INTERNAL_API_TOKEN", ""):
+            client = self._client()
+            self.assertEqual(client.get("/health").status_code, 200)
+            self.assertEqual(client.get("/ready").status_code, 200)
+
+    def test_ready_reports_auth_required(self):
+        with mock.patch.object(settings, "INTERNAL_API_TOKEN", self.TOKEN):
+            body = self._client().get("/ready").json()
+        self.assertTrue(body["auth_required"])
+
+        with mock.patch.object(settings, "INTERNAL_API_TOKEN", ""):
+            body = self._client().get("/ready").json()
+        self.assertFalse(body["auth_required"])
+
+    def test_health_and_ready_stay_open_when_enabled(self):
+        """Giữ mở để monitoring/script kiểm tra sống không cần biết token."""
+        with mock.patch.object(settings, "INTERNAL_API_TOKEN", self.TOKEN):
+            client = self._client()
+            self.assertEqual(client.get("/health").status_code, 200)
+            self.assertEqual(client.get("/ready").status_code, 200)
+
+    def test_chat_rejects_missing_token(self):
+        with mock.patch.object(settings, "INTERNAL_API_TOKEN", self.TOKEN):
+            response = self._client().post(
+                "/chat", json={"chat_id": "1", "new_question": "q"}
+            )
+        self.assertEqual(response.status_code, 401)
+
+    def test_chat_rejects_wrong_token(self):
+        with mock.patch.object(settings, "INTERNAL_API_TOKEN", self.TOKEN):
+            response = self._client().post(
+                "/chat",
+                json={"chat_id": "1", "new_question": "q"},
+                headers={"X-Internal-Token": "sai-token"},
+            )
+        self.assertEqual(response.status_code, 401)
+
+    def test_batch_rejects_missing_token(self):
+        with mock.patch.object(settings, "INTERNAL_API_TOKEN", self.TOKEN):
+            response = self._client().post(
+                "/chat/batch", json={"items": [{"chat_id": "1", "new_question": "q"}]}
+            )
+        self.assertEqual(response.status_code, 401)
+
+    def test_chat_accepts_correct_token(self):
+        with mock.patch.object(settings, "INTERNAL_API_TOKEN", self.TOKEN):
+            with mock.patch.object(settings, "RAG_ENABLED", False):
+                response = self._client().post(
+                    "/chat",
+                    json={"chat_id": "1", "new_question": "q"},
+                    headers={"X-Internal-Token": self.TOKEN},
+                )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["answer"])
+
+
+class InputLimitTests(unittest.TestCase):
+    """Trần kích thước đầu vào chống prompt khổng lồ."""
+
+    def test_question_longer_than_limit_is_rejected(self):
+        from schemas import ChatRequest
+
+        with self.assertRaises(Exception):
+            ChatRequest(
+                chat_id="1",
+                new_question="x" * (settings.MAX_QUESTION_LENGTH + 1),
+            )
+
+    def test_question_at_limit_is_accepted(self):
+        from schemas import ChatRequest
+
+        request = ChatRequest(
+            chat_id="1", new_question="x" * settings.MAX_QUESTION_LENGTH
+        )
+        self.assertEqual(len(request.new_question), settings.MAX_QUESTION_LENGTH)
+
+    def test_history_longer_than_limit_is_rejected(self):
+        from schemas import ChatRequest
+
+        with self.assertRaises(Exception):
+            ChatRequest(
+                chat_id="1",
+                new_question="q",
+                history=[
+                    {"role": "user", "content": "a"}
+                    for _ in range(settings.MAX_HISTORY_MESSAGES + 1)
+                ],
+            )
+
+    def test_message_content_longer_than_limit_is_rejected(self):
+        from schemas import ChatMessage
+
+        with self.assertRaises(Exception):
+            ChatMessage(
+                role="user", content="x" * (settings.MAX_MESSAGE_LENGTH + 1)
+            )
+
+    def test_defaults_are_sane(self):
+        """Các trần phải lớn hơn giá trị denso_backend gửi sang, nếu không sẽ 422."""
+        self.assertGreater(settings.MAX_HISTORY_MESSAGES, 100)
+        self.assertGreaterEqual(settings.MAX_QUESTION_LENGTH, 8000)
+
+
+class SafeTableTests(unittest.TestCase):
+    """``RAG_CHUNK_TABLE`` được nội suy vào SQL nên phải qua allow-list."""
+
+    def test_accepts_plain_and_schema_qualified_names(self):
+        from database.controllers import _safe_table
+
+        self.assertEqual(_safe_table("rag_chunkdata"), "rag_chunkdata")
+        self.assertEqual(_safe_table("public.rag_chunkdata"), "public.rag_chunkdata")
+
+    def test_rejects_injection_attempts(self):
+        from database.controllers import _safe_table
+
+        for bad in (
+            "rag_chunkdata; DROP TABLE core_users",
+            "rag_chunkdata--",
+            "1abc",
+            "",
+            "a.b.c",
+            'rag_chunkdata"',
+            "rag chunkdata",
+        ):
+            with self.assertRaises(ValueError, msg=f"phải từ chối: {bad!r}"):
+                _safe_table(bad)
+
+
+class EndEventCarriesContextsTests(ApiTestCase):
+    """Event ``end`` của luồng SSE phải mang ``contexts``.
+
+    Client streaming cần nguồn tham khảo ngay khi sinh xong; nếu thiếu trường này
+    thì UI buộc phải gọi lại API không-stream (tốn thêm một lượt LLM) hoặc đơn
+    giản là không hiển thị được nguồn.
+    """
+
+    def test_contexts_are_populated_when_rag_hits(self):
+        """RAG có kết quả -> ``contexts`` trong event ``end`` phải có dữ liệu."""
+        fake_context = "- đoạn tài liệu A\n- đoạn tài liệu B"
+
+        async def fake_retrieve(questions, top_k):
+            return [fake_context for _ in questions]
+
+        with mock.patch.object(services, "retrieve_contexts", side_effect=fake_retrieve):
+            response = self.client.post(
+                "/chat",
+                json={"chat_id": "1", "new_question": "q", "stream": True},
+            )
+
+        events = _parse_sse(response.text)
+        end = [e for e in events if e.get("type") == "end"]
+        self.assertTrue(end, f"không thấy event end: {events}")
+        self.assertIn("contexts", end[0], "event end phải có trường contexts")
+        self.assertEqual(end[0]["contexts"], [fake_context])
+
+    def test_end_event_contexts_empty_when_no_rag_hit(self):
+        with mock.patch.object(settings, "RAG_ENABLED", False):
+            response = self.client.post(
+                "/chat",
+                json={"chat_id": "1", "new_question": "q", "stream": True},
+            )
+
+        events = _parse_sse(response.text)
+        end = [e for e in events if e.get("type") == "end"]
+        self.assertTrue(end)
+        # Không có context -> vẫn phải có key (giá trị rỗng) để client không
+        # phải phân biệt "thiếu trường" với "không có kết quả".
+        self.assertEqual(end[0].get("contexts"), [])
+
+    def test_sse_media_type_declares_utf8(self):
+        """Content-Type phải khai báo charset=utf-8 (xem bug mojibake tiếng Việt)."""
+        response = self.client.post(
+            "/chat",
+            json={"chat_id": "1", "new_question": "q", "stream": True},
+        )
+        self.assertIn("text/event-stream", response.headers["content-type"])
+        self.assertIn("charset=utf-8", response.headers["content-type"].lower())
+
+
 if __name__ == "__main__":
     unittest.main()

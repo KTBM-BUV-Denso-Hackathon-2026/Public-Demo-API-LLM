@@ -22,7 +22,11 @@ class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"] = Field(
         ..., description="Vai trò của tin nhắn."
     )
-    content: str = Field(default="", description="Nội dung tin nhắn.")
+    content: str = Field(
+        default="",
+        max_length=settings.MAX_MESSAGE_LENGTH,
+        description="Nội dung tin nhắn.",
+    )
 
 
 class ChatRequest(BaseModel):
@@ -41,8 +45,17 @@ class ChatRequest(BaseModel):
     """
 
     chat_id: str = Field(..., min_length=1, description="ID cuộc hội thoại.")
-    new_question: str = Field(..., min_length=1, description="Câu hỏi mới.")
-    history: List[ChatMessage] = Field(default_factory=list)
+    new_question: str = Field(
+        ...,
+        min_length=1,
+        max_length=settings.MAX_QUESTION_LENGTH,
+        description="Câu hỏi mới.",
+    )
+    history: List[ChatMessage] = Field(
+        default_factory=list,
+        max_length=settings.MAX_HISTORY_MESSAGES,
+        description="Lịch sử trước đó. Caller nên tự cắt bớt trước khi gửi.",
+    )
     stream: bool = False
     top_k: Optional[int] = Field(default=None, ge=1, le=50)
     temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
@@ -105,7 +118,8 @@ class StreamEvent(BaseModel):
     ``type`` nhận một trong các giá trị:
     - ``start``: bắt đầu một item (kèm ``chat_id``, ``index``).
     - ``delta``: một đoạn text mới sinh ra (``delta``).
-    - ``end``: kết thúc một item (``messages`` là history đã cập nhật).
+    - ``end``: kết thúc một item (``messages`` là history đã cập nhật,
+      ``contexts`` là các đoạn RAG đã dùng).
     - ``error``: lỗi khi xử lý item (``error`` chứa thông báo).
     """
 
@@ -115,3 +129,7 @@ class StreamEvent(BaseModel):
     delta: Optional[str] = None
     error: Optional[str] = None
     messages: Optional[List[ChatMessage]] = None
+    # Đoạn RAG đã truy hồi, cùng định dạng với ``ChatResponse.contexts``.
+    # Có mặt ở event ``end`` để client hiển thị "nguồn tham khảo" ngay cả khi
+    # đang stream — trước đó client bắt buộc phải gọi lại không-stream để có nó.
+    contexts: Optional[List[str]] = None
