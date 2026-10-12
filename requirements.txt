@@ -1,10 +1,28 @@
-# Dependencies trực tiếp của microservice llm_api.
-# (torch/transformers được kéo theo bởi sentence-transformers.)
-
-fastapi>=0.115
-uvicorn>=0.30
-pydantic>=2.7
-openai>=1.40
-psycopg2>=2.9
-sentence-transformers>=3.0
-python-dotenv>=1.0
+# =============================================================================
+#  ĐÃ GỘP — dùng file tổng ở thư mục gốc dự án.
+# =============================================================================
+#
+#     pip install -r requirements.txt          (chạy từ thư mục gốc dự án)
+#
+#  File này GIỮ LẠI (thay vì xoá) chỉ để máy/CI cũ vẫn không báo lỗi.
+#  Nó cố ý KHÔNG liệt kê gói nào — cài từ đây sẽ không cài được gì.
+#
+#  Lý do gộp:
+#    Bản cũ ghim bằng dấu ">=" (fastapi>=0.115, openai>=1.40, ...) nên mỗi
+#    máy có thể nhận một phiên bản khác nhau. Với các gói nặng đi kèm
+#    (torch, numpy, scipy, scikit-learn, pillow, tokenizers) bản mới nhất
+#    ĐÃ BỎ hỗ trợ Python 3.9 và không còn wheel cho Windows — pip sẽ phải
+#    biên dịch từ mã nguồn và dừng lại với lỗi:
+#        "error: Microsoft Visual C++ 14.0 or greater is required"
+#
+#    File tổng đã bật sẵn `--only-binary=:all:` để chặn đúng lỗi đó.
+#
+#  Nhóm thuộc llm_api trong file tổng:
+#    mục 6  FastAPI services — fastapi, uvicorn, pydantic, openai,
+#                                sentence-transformers
+#    mục 4  psycopg2, pgvector
+#    mục 7  torch, numpy, scipy, scikit-learn, tokenizers, safetensors,
+#           pillow  (đều có extension C — bắt buộc phải có wheel)
+#
+#  Dùng chung với denso_backend và rag_worker — cài một lần cho cả dự án.
+# =============================================================================

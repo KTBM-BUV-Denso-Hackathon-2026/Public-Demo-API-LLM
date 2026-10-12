@@ -148,7 +148,7 @@ Các biến thường dùng: `LM_DEPLOY_BASE_URL`, `LLM_MODEL`, `RAG_ENABLED`,
 ## 5. Chạy & test
 
 ```bash
-pip install -r requirements.txt
+pip install -r ../requirements.txt   # file tổng ở thư mục gốc
 cp .env.example .env        # rồi chỉnh DATABASE_URL + INTERNAL_API_TOKEN cho khớp
 uvicorn main:app --host 127.0.0.1 --port 8100
 ```
